@@ -1,0 +1,227 @@
+{import os
+import asyncio
+import logging
+from typing import Dict, Optional
+from web3 import Web3, AsyncWeb3
+from web3.contract import Contract
+from web3.middleware import geth_poa_middleware
+from eth_account import Account
+from dotenv import load_dotenv
+
+# 环境加载
+load_dotenv()
+
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "configurations": [
+        
+
+    ],
+    handlers=[
+        logging.FileHandler("arbitrage.log"),
+        logging.StreamHandler()
+    ]
+)
+
+class ArbitrageCore:
+    """
+    套利系统核心模块
+    功能包含：
+    - 多链连接管理
+    - 动态Gas优化
+    - 闪电贷执行
+    - 跨链套利
+    - 实时监控
+    """
+    
+    def __init__(self):
+        # 初始化区块链连接
+        self.chains = self._init_chains()
+        self._validate_connections()
+        
+        # 加载账户
+        self.account = self._load_account()
+        
+        # 合约配置
+        self.contracts = {
+            'chainlink': self._load_contract(
+                address=os.getenv("CHAINLINK_ADDRESS"),
+                abi=self._get_chainlink_abi()
+            ),
+            'aave': self._load_contract(
+                address=os.getenv("AAVE_POOL_ADDRESS"),
+                abi=self._get_aave_abi()
+            )
+        }
+        
+        # 状态监控
+        self.last_arbitrage = None
+        self.profit_history = []
+
+    def _init_chains(self) -> Dict[str, AsyncWeb3]:
+        """初始化多链连接"""
+        return {
+            'eth': AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(os.getenv("ETH_RPC"))),
+            'polygon': AsyncWeb3.polygon(
+                AsyncWeb3.AsyncHTTPProvider(os.getenv("POLYGON_RPC")),
+                middleware={geth_poa_middleware}
+            )
+        }
+
+    def _validate_connections(self):
+        """验证区块链连接"""
+        for name, chain in self.chains.items():
+            if not chain.isConnected():
+                raise ConnectionError(f"{name} 连接失败")
+
+    def _load_account(self) -> Account:
+        """安全加载账户"""
+        private_key = os.getenv("PRIVATE_KEY")
+        if not private_key:
+            raise ValueError("未配置私钥")
+        return Account.from_key(private_key)
+
+    def _load_contract(self, address: str, abi: list) -> Contract:
+        """加载智能合约"""
+        return self.chains['eth'].eth.contract(
+            address=address,
+            abi=abi
+        )
+
+    async def dynamic_gas_optimizer(self, chain: str) -> Dict:
+        """动态Gas优化器（支持EIP-1559）"""
+        latest_block = await self.chains[chain].eth.get_block('latest')
+        base_fee = latest_block['baseFeePerGas']
+        priority_fee = await self.chains[chain].eth.max_priority_fee
+        
+        return {
+            'maxFeePerGas': int(base_fee * 1.25),
+            'maxPriorityFeePerGas': int(priority_fee * 1.1),
+            'nonce': await self.chains[chain].eth.get_transaction_count(self.account.address)
+        }
+
+    async def execute_flash_loan(self, amount: int) -> Optional[str]:
+        """执行闪电贷套利"""
+        try:
+            # 构建闪电贷交易
+            tx_params = await self.dynamic_gas_optimizer('eth')
+            flash_loan_tx = self.contracts['aave'].functions.flashLoan(
+                self.account.address,
+                [os.getenv("WETH_ADDRESS")],
+                [amount],
+                [0],
+                self.account.address,
+                b""
+            ).build_transaction(tx_params)
+            
+            # 签名并发送交易
+            signed_tx = self.account.sign_transaction(flash_loan_tx)
+            tx_hash = await self.chains['eth'].eth.send_raw_transaction(signed_tx.rawTransaction)
+            
+            # 等待交易确认
+            receipt = await self.chains['eth'].eth.wait_for_transaction_receipt(tx_hash)
+            if receipt.status == 1:
+                return tx_hash.hex()
+            return None
+        except Exception as e:
+            logging.error(f"闪电贷执行失败: {str(e)}")
+            return None
+
+    async def cross_chain_arbitrage(self, amount: float) -> Dict:
+        """跨链套利核心逻辑"""
+        try:
+            # 获取跨链价格差
+            eth_price = await self.get_price('eth')
+            polygon_price = await self.get_price('polygon')
+            
+            if eth_price == 0 or polygon_price == 0:
+                raise ValueError("价格获取失败")
+            
+            # 计算套利方向
+            if eth_price > polygon_price * 1.01:  # 1% 阈值
+                direction = "eth_to_polygon"
+            elif polygon_price > eth_price * 1.01:
+                direction = "polygon_to_eth"
+            else:
+                return {"status": "no_opportunity"}
+            
+            # 执行套利
+            if direction == "eth_to_polygon":
+                return await self._execute_arbitrage(
+                    from_chain='eth',
+                    to_chain='polygon',
+                    amount=amount
+                )
+            else:
+                return await self._execute_arbitrage(
+                    from_chain='polygon',
+                    to_chain='eth',
+                    amount=amount
+                )
+        except Exception as e:
+            logging.error(f"跨链套利失败: {str(e)}")
+            return {"status": "failed"}
+
+    async def _execute_arbitrage(self, from_chain: str, to_chain: str, amount: float) -> Dict:
+        """执行具体套利操作"""
+        # 步骤1: 跨链转账
+        bridge_result = await self.bridge_assets(from_chain, to_chain, amount)
+        if not bridge_result['success']:
+            return bridge_result
+        
+        # 步骤2: 目标链交易
+        trade_result = await self.execute_trade(to_chain, amount)
+        if not trade_result['success']:
+            return trade_result
+        
+        # 步骤3: 返回资金
+        return_bridge = await self.bridge_assets(to_chain, from_chain, trade_result['amount'])
+        
+        return {
+            "status": "success" if return_bridge['success'] else "partial_success",
+            "profit": trade_result['profit']
+        }
+
+    async def monitor_markets(self):
+        """实时市场监控"""
+        async with self.chains['eth'].ws.connect() as ws:
+            await ws.subscribe("newHeads")
+            async for message in ws:
+                await self._analyze_market_conditions()
+
+    async def _analyze_market_conditions(self):
+        """市场条件分析"""
+        # 此处可添加机器学习模型预测
+        await self.cross_chain_arbitrage(1.0)  # 示例交易量
+
+# 辅助函数和ABI定义（因篇幅限制部分省略）
+# 完整实现需要包含：get_price, bridge_assets, execute_trade等方法
+# 以及Chainlink、Aave等合约的完整ABI定义
+
+if __name__ == "__main__":
+    arb_system = ArbitrageCore()
+    
+    # 启动事件循环
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.create_task(arb_system.monitor_markets()),
+        loop.create_task(arb_system.cross_chain_arbitrage(1.0))
+    ]
+    loop.run_until_complete(asyncio.gather(*tasks))
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "type": "msedge",
+            "request": "launch",
+            "name": "针对 localhost 启动 Edge",
+            "url": "http://localhost:8080",
+            "webRoot": "${workspaceFolder}"
+        }
+    ]
+}
